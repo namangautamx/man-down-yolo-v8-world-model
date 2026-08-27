@@ -1,0 +1,78 @@
+# ============================================================================
+# yw_mandown - configuration template
+#
+# Copy this to config/config.yaml and edit. Every knob the pipeline uses
+# comes from here -- nothing is hardcoded in the scripts.
+# ============================================================================
+
+model:
+  name: "yolov8m-worldv2.pt"   # or yolov8s-worldv2.pt for a lighter/faster model
+  device: null                 # null = auto (cuda if available), or "cuda", "cpu"
+  image_size: 640
+
+prompts:
+  positive:
+    - "a person lying on the floor"
+    - "a person lying on the ground"
+    - "a person sleeping"
+
+  # Distractor classes: set as YOLO-World classes so look-alike boxes (mats,
+  # standing people, luggage) have their own class to land in instead of
+  # competing with the person boxes. Their detections are discarded -- they
+  # cannot veto a positive. Leave empty to disable, at a measured cost of
+  # roughly 30% of detections. Standing people are rejected by
+  # geometry.min_aspect_ratio, not by these.
+  negative:
+    - "a person standing"
+    - "a person walking"
+    - "a mattress"
+    - "a pile of bags"
+
+  conf_threshold: 0.25          # positive detections below this are discarded
+
+
+processing:
+  frame_skip: 2                 # run inference on every Nth frame; display/clips still get every frame
+
+output:
+  base_folder: "./output"       # frames/<source_id>/ and clips/<source_id>/ live under here
+  save_frames: true             # save the WHOLE annotated frame, not a crop of the box
+  save_clips: true
+  clip_pre_seconds: 3.0         # seconds of rolling buffer written before the trigger frame
+  clip_post_seconds: 3.0        # seconds kept recording after the last detection
+  frame_min_interval_seconds: 1.0  # don't save a frame more than once per this many seconds
+
+display:
+  show_window: true             # one source -> its own window; several -> see layout below
+  layout: "separate"            # one window per camera; "grid" puts them all in one
+  fit_to_screen: true           # scale the window down to your display (never scales up)
+  screen_margin: 0.9            # use at most this fraction of the screen
+  max_width: null               # set BOTH to pin an exact window size and ignore the screen
+  max_height: null
+  window_name: "MAN-DOWN DETECTION"
+
+logging:
+  events_path: "./logs/events.jsonl"
+
+# ----------------------------------------------------------------------------
+# Sources. Add as many as you want; only ones with enabled: true are run.
+# One source enabled -> runs in the main thread, live window allowed.
+# More than one enabled -> runs threaded, live window forced off for all
+# (see yw_mandown/cli.py docstring for why).
+# ----------------------------------------------------------------------------
+sources:
+  - id: "sample_folder"
+    type: "video_folder"          # video_file | video_folder | rtsp
+    path: "/home/naman-gautam/Downloads/man_down_sample"
+    enabled: true
+
+  - id: "single_clip"
+    type: "video_file"
+    path: "/home/naman-gautam/Downloads/man down vdeios/1aaa01.mp4"
+    enabled: false
+
+  - id: "cam1"
+    type: "rtsp"
+    url: "rtsp://admin:Obama%40786@192.168.0.60/"
+    reconnect_delay_seconds: 2.0
+    enabled: false
