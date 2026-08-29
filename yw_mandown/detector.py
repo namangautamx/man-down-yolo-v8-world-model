@@ -100,15 +100,12 @@ class YoloWorldDetector:
         )
         result = results[0]
 
-        positives = []
+        positives, negatives = [], []
         if result.boxes is None:
-            return positives
+            return positives, []
 
         for box in result.boxes:
             class_id = int(box.cls[0].cpu().numpy())
-            if class_id >= len(self.positive_prompts):
-                continue  # a distractor class did its job; nothing to report
-
             conf = float(box.conf[0].cpu().numpy())
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
             x1, y1 = max(0, min(x1, w - 1)), max(0, min(y1, h - 1))
@@ -116,11 +113,25 @@ class YoloWorldDetector:
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            positives.append(
-                Detection((x1, y1, x2, y2), conf, self.all_prompts[class_id])
-            )
+            det = Detection((x1, y1, x2, y2), conf, self.all_prompts[class_id])
+            (positives if class_id < len(self.positive_prompts)
+             else negatives).append(det)
 
-        return positives
+        # A distractor class winning the argmax normally means it did its job --
+        # a mat-shaped box landed on "a mattress" instead of competing with the
+        # person boxes. But the model also finds the mat UNDERNEATH a fallen
+        # person: the removed veto fired 39 times on crash-mat footage and every
+        # one was a real casualty. When a distractor box has NO positive box
+        # overlapping it, that region was claimed entirely by the distractor and
+        # a genuine man-down could have been erased with no record at all.
+        #
+        # Those are returned as "shadows" so the audit log can record them. They
+        # are NOT promoted to detections -- doing so would undo the measured
+        # benefit of the distractor classes (17/120 frames with them vs 12/120
+        # without). Making the failure visible is the fix; guessing is not.
+        shadows = [n for n in negatives
+                   if not any(iou(n.xyxy, p.xyxy) >= 0.30 for p in positives)]
+        return positives, shadows
 
     @staticmethod
     def _clipped_by_edge(box, frame_shape, mode, margin):
@@ -150,8 +161,10 @@ class YoloWorldDetector:
     @staticmethod
     def filter_by_geometry(positives, min_aspect_ratio, frame_shape=None,
                            edge_mode="none", edge_margin=8):
-        """Drop positives whose box is taller than it is wide, or clipped by the
-        frame edge.
+        """Split positives into (kept, rejected).
+
+        rejected carries (detection, reason, measured, limit) so the audit log
+        can record the number responsible, not just that something vanished.
 
         A person on the floor projects a wide box; a person standing projects a
         tall one. This is the single most reliable signal separating the two --
@@ -162,19 +175,23 @@ class YoloWorldDetector:
         The edge check exists because that reasoning only holds for a box that
         contains the whole body -- see _clipped_by_edge.
         """
-        kept = []
+        kept, rejected = [], []
         for p in positives:
             x1, y1, x2, y2 = p.xyxy
             h = y2 - y1
             if h <= 0:
+                rejected.append((p, "degenerate_box", 0.0, 0.0))
                 continue
-            if min_aspect_ratio and (x2 - x1) / h < min_aspect_ratio:
+            ar = (x2 - x1) / h
+            if min_aspect_ratio and ar < min_aspect_ratio:
+                rejected.append((p, "aspect", ar, min_aspect_ratio))
                 continue
             if YoloWorldDetector._clipped_by_edge(p.xyxy, frame_shape,
                                                   edge_mode, edge_margin):
+                rejected.append((p, "frame_edge", float(y2), float(edge_margin)))
                 continue
             kept.append(p)
-        return kept
+        return kept, rejected
 
 
 class SecondPassVeto:

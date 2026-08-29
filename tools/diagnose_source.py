@@ -89,10 +89,16 @@ def main():
         if frame_number % skip:
             continue
 
-        raw = det.infer(frame)
+        raw, shadows = det.infer(frame)
         h, w = frame.shape[:2]
         verdicts = []
         survivors = []
+
+        # a distractor class claimed a region with no positive box near it --
+        # a real casualty can be erased here with no other trace
+        for sh in shadows:
+            verdicts.append((sh, "negative_class_shadow",
+                             f"claimed by {sh.class_name!r} at {sh.conf:.2f}"))
 
         for p in raw:
             x1, y1, x2, y2 = p.xyxy

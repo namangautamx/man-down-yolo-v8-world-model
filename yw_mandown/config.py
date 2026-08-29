@@ -8,6 +8,8 @@ wrong type -- rather than crashing three minutes into a run.
 """
 
 import os
+import re
+
 import yaml
 
 
@@ -35,20 +37,19 @@ DEFAULTS = {
         "reject_edge_touching": "bottom",  # "none" | "bottom" | "any"
         "edge_margin_px": 8,
     },
+    "temporal": {
+        "enabled": True,
+        "confirm_frames": 2,     # need this many detections...
+        "window_frames": 4,      # ...within this many recent inference frames
+    },
     "stillness": {
         "enabled": True,
         "still_seconds": 3.0,    # how long a box must hold position before it alarms
         "max_drift": 0.02,       # centroid movement per inference frame, in box widths
         "max_growth": 0.03,      # box area change per inference frame
         "match_iou": 0.30,       # IoU needed to call it the same box next frame
-        "track_timeout_seconds": 2.0,
+        "track_timeout_seconds": 15.0,
         "min_observations": 4,   # never confirm on fewer sightings than this
-    },
-    "temporal": {
-        "enabled": True,
-        "confirm_frames": 3,
-        "window_frames": 6,
-        "hold_frames": 15,
     },
     "processing": {
         "frame_skip": 2,
@@ -73,6 +74,10 @@ DEFAULTS = {
     },
     "logging": {
         "events_path": "./logs/events.jsonl",
+        "audit_path": "./logs/audit.jsonl",   # every candidate + why it died
+        "audit_enabled": True,
+        "stale_after_seconds": 30.0,   # warn if a source produces no frame for this long
+        "measured_inf_per_sec": None,  # set from tools/bench_prompts.py on the deployment GPU
     },
     "sources": [],
 }
@@ -96,6 +101,31 @@ def _merge_defaults(user_cfg, defaults):
         if key not in defaults:
             merged[key] = val
     return merged
+
+
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env(value, where, errors):
+    """Replace ${VAR} with the environment value.
+
+    Credentials must not live in the config file: config/config.yaml is tracked
+    by git, so anything written here is committed. Unset variables are a config
+    ERROR rather than an empty substitution -- a camera silently authenticating
+    with a blank password would fail at connect time, far from the cause.
+    """
+    if not isinstance(value, str):
+        return value
+
+    def sub(m):
+        name = m.group(1)
+        got = os.environ.get(name)
+        if got is None:
+            errors.append(f"{where}: environment variable ${{{name}}} is not set")
+            return m.group(0)
+        return got
+
+    return _ENV_PATTERN.sub(sub, value)
 
 
 def load_config(path):
@@ -162,6 +192,7 @@ def _migrate_legacy_keys(raw):
 
 def _validate(cfg, path):
     errors = []
+    warnings = []
 
     if not cfg["prompts"]["positive"]:
         errors.append(
@@ -174,6 +205,14 @@ def _validate(cfg, path):
             "sources is empty. Add at least one entry under 'sources:' "
             "(type: video_file / video_folder / rtsp)."
         )
+
+    # secrets are expanded here, after defaults are merged and before any
+    # source is opened, so an unset variable is reported with the others
+    for src in cfg["sources"]:
+        for key in ("url", "path"):
+            if key in src:
+                src[key] = _expand_env(src[key], f"source '{src.get('id', '?')}'.{key}",
+                                       errors)
 
     valid_types = {"video_file", "video_folder", "rtsp"}
     seen_ids = set()
@@ -202,6 +241,11 @@ def _validate(cfg, path):
                     f"source '{label}': path does not exist: {src['path']}"
                 )
 
+        mount = src.get("mount", "oblique")
+        if mount not in ("oblique", "overhead"):
+            errors.append(f"source '{label}': mount must be 'oblique' or "
+                          f"'overhead', got {mount!r}")
+
         if src.get("type") == "rtsp" and not src.get("url"):
             errors.append(f"source '{label}': type=rtsp requires 'url'")
 
@@ -217,6 +261,15 @@ def _validate(cfg, path):
     vk = cfg["prompts"]["veto_containment"]
     if not isinstance(vk, (int, float)) or not (0 < vk <= 1):
         errors.append(f"prompts.veto_containment must be in (0, 1], got {vk!r}")
+
+    T = cfg["temporal"]
+    for key in ("confirm_frames", "window_frames"):
+        if not isinstance(T[key], int) or T[key] < 1:
+            errors.append(f"temporal.{key} must be a positive integer, got {T[key]!r}")
+    if (isinstance(T["window_frames"], int) and isinstance(T["confirm_frames"], int)
+            and T["window_frames"] < T["confirm_frames"]):
+        errors.append(f"temporal.window_frames ({T['window_frames']}) must be >= "
+                      f"temporal.confirm_frames ({T['confirm_frames']})")
 
     S = cfg["stillness"]
     if S["still_seconds"] < 0:
@@ -255,18 +308,86 @@ def _validate(cfg, path):
     if ar is not None and ar < 0:
         errors.append("geometry.min_aspect_ratio must be >= 0 (0 or null disables it)")
 
-    t = cfg["temporal"]
-    for key in ("confirm_frames", "window_frames", "hold_frames"):
-        if not isinstance(t[key], int) or t[key] < 0:
-            errors.append(f"temporal.{key} must be a non-negative integer, got {t[key]!r}")
-    if isinstance(t["window_frames"], int) and isinstance(t["confirm_frames"], int):
-        if t["window_frames"] < t["confirm_frames"]:
-            errors.append(
-                f"temporal.window_frames ({t['window_frames']}) must be >= "
-                f"temporal.confirm_frames ({t['confirm_frames']})"
+    # ---- BUG 8: the same camera entered under several ids ----
+    seen_urls = {}
+    for src in cfg["sources"]:
+        if src.get("type") != "rtsp" or not src.get("enabled", True):
+            continue
+        u = src.get("url")
+        if u:
+            seen_urls.setdefault(u, []).append(src.get("id", "?"))
+    for u, ids in seen_urls.items():
+        if len(ids) > 1:
+            host = u.split("@")[-1]
+            warnings.append(
+                f"sources {ids} are the same camera ({host}). Each would decode "
+                f"the stream again, raise duplicate alarms for one incident, and "
+                f"spend inference budget on copies. Give each id its own URL, or "
+                f"disable the duplicates."
             )
-    if isinstance(t["confirm_frames"], int) and t["confirm_frames"] < 1:
-        errors.append("temporal.confirm_frames must be >= 1")
+
+    # ---- BUG 10: batch folders competing with live safety cameras ----
+    live = [s.get("id") for s in cfg["sources"]
+            if s.get("enabled", True) and s.get("type") == "rtsp"]
+    batch = [s.get("id") for s in cfg["sources"]
+             if s.get("enabled", True) and s.get("type") in ("video_folder", "video_file")]
+    if live and batch:
+        warnings.append(
+            f"batch sources {batch} are enabled alongside live cameras {live}. "
+            f"Backfill competes for the same serialized GPU as live monitoring and "
+            f"forces the live display off. Run batch in a separate process."
+        )
+
+    # ---- BUG 9: throughput the deployment cannot meet ----
+    #
+    # The reference numbers below were measured on ONE machine (RTX 5050 Laptop,
+    # 1920x1080 input). They are a starting point for whoever moves this to the
+    # deployment GPU, not a fact about that GPU. Re-measure there:
+    #
+    #     python tools/bench_prompts.py --video <clip> --imgsz <n>
+    #
+    # and set logging.measured_inf_per_sec so this check uses the real number.
+    #
+    # This matters more than ordinary slowness: the stillness and flicker gates
+    # count INFERENCE frames while still_seconds is wall-clock. If the GPU
+    # cannot keep up, fewer inferences land inside the same 6 seconds, the gates
+    # get harder to satisfy, and recall drops with nothing to announce it.
+    n_live = len(live)
+    if n_live:
+        skip = max(1, cfg["processing"]["frame_skip"])
+        reference = {("yolov8m-worldv2.pt", 960): 63.2,
+                     ("yolov8m-worldv2.pt", 640): 85.5,
+                     ("yolov8s-worldv2.pt", 960): 120.7,
+                     ("yolov8s-worldv2.pt", 640): 210.8}
+        measured = cfg["logging"].get("measured_inf_per_sec")
+        have = measured or reference.get(
+            (cfg["model"]["name"], cfg["model"]["image_size"]))
+        if have:
+            need = n_live * 15.0 / skip
+            source = ("measured on this machine" if measured
+                      else "reference figure from a different GPU -- RE-MEASURE")
+            if need > have:
+                warnings.append(
+                    f"{n_live} live cameras at 15fps with frame_skip {skip} need "
+                    f"~{need:.0f} inf/s; {cfg['model']['name']} at "
+                    f"{cfg['model']['image_size']}px gives {have:.0f} inf/s "
+                    f"({source}). Gates counted in inference frames get harder to "
+                    f"satisfy as throughput falls, so recall degrades silently. "
+                    f"Smaller model or image_size, higher frame_skip, or split "
+                    f"across processes."
+                )
+            elif not measured:
+                warnings.append(
+                    "throughput headroom is being judged against a reference GPU, "
+                    "not this one. Run tools/bench_prompts.py on the deployment "
+                    "machine and set logging.measured_inf_per_sec."
+                )
+
+    # Deployment problems are shouted, not fatal: a safety system taken offline
+    # by a config check is worse than one running with a known flaw. Correctness
+    # errors below still refuse to start.
+    for w in warnings:
+        print(f"CONFIG WARNING: {w}")
 
     if errors:
         msg = f"Config errors in {path}:\n" + "\n".join(f"  - {e}" for e in errors)

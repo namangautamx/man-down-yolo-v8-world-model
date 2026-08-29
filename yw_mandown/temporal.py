@@ -1,30 +1,15 @@
 """
-Temporal confirmation + hold, so a man-down alarm is a state rather than a
-per-frame coin flip.
+Two gates between the model and an alarm, both strictly subtractive.
 
-Measured on the cam1 live run before this existed: 158 frames carried a
-detection, spread over 29 separate runs, 13 of them a single frame long, with
-only 82% of consecutive detections actually adjacent. The person never moved
-during those gaps -- the model just lost them for a frame or two. That is what
-"not continuous" looks like on screen.
+TemporalConfirmer  requires repeated evidence before an alarm, so a
+                   one-frame flicker cannot raise one.
+StillnessGate      requires the box to hold position, so a moving person
+                   cannot.
 
-Two knobs, doing two different jobs:
-
-  confirm_frames / window_frames  raise the alarm only after N of the last M
-                                  inference frames detected something. Kills
-                                  the 13 single-frame blips, which is also
-                                  where most brief false positives live.
-
-  hold_frames                     once raised, keep the alarm up for this many
-                                  consecutive empty inference frames before
-                                  dropping it. Bridges the gaps, so one fall is
-                                  one continuous alarm and one clip instead of
-                                  five fragments.
-
-Counted in INFERENCE frames, not video frames: with processing.frame_skip: 2,
-hold_frames: 15 is 30 video frames.
+Neither may ever produce a box on a frame the model did not fire on. An
+earlier TemporalConfirmer had a "hold" that kept an alarm alive across empty
+frames and redrew the last box; that invented detections and was removed.
 """
-
 import math
 
 from collections import deque
@@ -33,51 +18,47 @@ from .detector import iou
 
 
 class TemporalConfirmer:
-    def __init__(self, confirm_frames, window_frames, hold_frames):
+    """Require N detections within the last M inference frames before alarming.
+
+    Purpose is narrow: stop a single-frame flicker from raising an alarm. On the
+    cam1 live run, 158 detected frames were spread over 29 separate runs, 13 of
+    them one frame long -- those are what this removes.
+
+    STRICTLY SUBTRACTIVE. update() returns either this frame's live detections or
+    an empty list. It never returns a stored box, never extends an alarm across a
+    frame the model was silent on, and never invents anything. The previous
+    version had a "hold" that did exactly that; it is gone. Keep it gone.
+
+    Deliberately short: the stillness gate already imposes the long wait, so a
+    second long confirmation on top would only delay a real alarm. This is a
+    flicker filter, not a second opinion.
+    """
+
+    def __init__(self, confirm_frames, window_frames):
         if window_frames < confirm_frames:
             raise ValueError("window_frames must be >= confirm_frames")
         self.confirm_frames = confirm_frames
-        self.hold_frames = hold_frames
         self._window = deque(maxlen=window_frames)
         self._active = False
-        self._empty_streak = 0
-        self._last_detections = []
 
     @property
     def active(self):
         return self._active
 
-    @property
-    def holding(self):
-        """True when the alarm is up on hold rather than a live detection --
-        the pipeline draws these boxes dimmer so what is real stays visible."""
-        return self._active and self._empty_streak > 0
-
     def update(self, detections):
-        """Feed one inference frame. Returns (alarm_active, detections_to_draw).
-
-        detections_to_draw is the live set when there is one, otherwise the last
-        live set while holding -- without it the box vanishes mid-hold and the
-        display flickers exactly as before, even though the alarm stayed up.
-        """
+        """Feed one inference frame's surviving detections. Returns the ones
+        allowed through -- always a subset of what was passed in."""
         had = len(detections) > 0
         self._window.append(had)
 
-        if had:
-            self._empty_streak = 0
-            self._last_detections = list(detections)
-            if not self._active and sum(self._window) >= self.confirm_frames:
-                self._active = True
-        else:
-            self._empty_streak += 1
-            if self._active and self._empty_streak > self.hold_frames:
-                self._active = False
-                self._last_detections = []
+        if sum(self._window) >= self.confirm_frames:
+            self._active = True
+        elif not had:
+            # nothing now, and not enough recent evidence: stand down
+            self._active = False
 
-        if not self._active:
-            return False, []
-        return True, (list(detections) if had else list(self._last_detections))
-
+        # a frame with no live detection yields nothing, whatever the state
+        return list(detections) if (self._active and had) else []
 
 
 def _median(xs):

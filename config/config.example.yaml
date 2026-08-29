@@ -60,6 +60,13 @@ logging:
 # More than one enabled -> runs threaded, live window forced off for all
 # (see yw_mandown/cli.py docstring for why).
 # ----------------------------------------------------------------------------
+# Credentials come from the environment, never from this file -- it is tracked
+# by git. Put them in .env (git-ignored) and source it before running:
+#     export CAM_USER=admin
+#     export CAM_PASS='...'
+#     export CAM1_HOST=10.x.x.x
+# ${VAR} is expanded at load time; an unset variable is a config error, not a
+# blank password.
 sources:
   - id: "sample_folder"
     type: "video_folder"          # video_file | video_folder | rtsp
@@ -73,6 +80,6 @@ sources:
 
   - id: "cam1"
     type: "rtsp"
-    url: "rtsp://admin:Obama%40786@192.168.0.60/"
+    url: "rtsp://${CAM_USER}:${CAM_PASS}@${CAM1_HOST}/"   # host and creds from .env
     reconnect_delay_seconds: 2.0
     enabled: false

@@ -89,7 +89,8 @@ def build_veto(cfg):
 def run_single(src_cfg, detector, cfg, veto=None):
     source = build_source(src_cfg)
     pipeline = SourcePipeline(source, detector, cfg, allow_window=True,
-                              veto=veto)
+                              veto=veto,
+                              source_cfg_mount=src_cfg.get("mount", "oblique"))
     return pipeline.run()
 
 
@@ -104,7 +105,8 @@ def run_threaded_with_window(sources_cfg, detector, cfg, veto=None):
     def worker(src_cfg):
         source = build_source(src_cfg, stop_flag=stop_event.is_set)
         pipeline = SourcePipeline(source, detector, cfg, allow_window=False,
-                                  frame_sink=latest.put, veto=veto)
+                                  frame_sink=latest.put, veto=veto,
+                                  source_cfg_mount=src_cfg.get("mount", "oblique"))
         try:
             results[src_cfg["id"]] = pipeline.run()
         finally:
@@ -178,7 +180,8 @@ def run_threaded(sources_cfg, detector, cfg, veto=None):
     def worker(src_cfg):
         source = build_source(src_cfg, stop_flag=stop_event.is_set)
         pipeline = SourcePipeline(source, detector, cfg, allow_window=False,
-                                  veto=veto)
+                                  veto=veto,
+                                  source_cfg_mount=src_cfg.get("mount", "oblique"))
         results[src_cfg["id"]] = pipeline.run()
 
     for src_cfg in sources_cfg:
