@@ -67,7 +67,10 @@ def main():
     veto = SecondPassVeto(cfg["model"]["name"], P["veto"], cfg["model"]["image_size"],
                           cfg["model"]["device"], P["veto_conf"], P["veto_iou"],
                           P["veto_containment"])
-    conf_t = TemporalConfirmer(T["confirm_frames"], T["window_frames"], T["hold_frames"])
+    # hold_frames was removed with the "hold" mechanism; reading it here made
+    # this tool crash on startup, i.e. exactly when you needed it.
+    conf_t = TemporalConfirmer(T["confirm_frames"], T["window_frames"],
+                               T["match_iou"])
 
     print(f"\nsource {args.source}  imgsz={cfg['model']['image_size']}  "
           f"conf_threshold={P['conf_threshold']}  min_aspect_ratio={G['min_aspect_ratio']}"
@@ -89,7 +92,7 @@ def main():
         if frame_number % skip:
             continue
 
-        raw, shadows = det.infer(frame)
+        raw, negatives, shadows = det.infer(frame)
         h, w = frame.shape[:2]
         verdicts = []
         survivors = []
@@ -99,6 +102,8 @@ def main():
         for sh in shadows:
             verdicts.append((sh, "negative_class_shadow",
                              f"claimed by {sh.class_name!r} at {sh.conf:.2f}"))
+
+
 
         for p in raw:
             x1, y1, x2, y2 = p.xyxy
@@ -116,6 +121,11 @@ def main():
                 continue
             survivors.append(p)
 
+        # same order as the pipeline: dedupe AFTER geometry
+        survivors, suppressed = det.dedupe(survivors, negatives)
+        for d, why, measured in suppressed:
+            verdicts.append((d, why.split(":")[0], f"{why} ({measured:.2f})"))
+
         if survivors and veto.enabled:
             kept, vetoes = veto.apply(frame, survivors)
             keptids = {id(k) for k in kept}
@@ -126,13 +136,18 @@ def main():
                     verdicts.append((p, "veto", f"{best.class_name} {best.conf:.2f}"))
             survivors = kept
 
-        on, _ = conf_t.update(survivors)
+        # update() returns the surviving subset -- it used to be unpacked as a
+        # 2-tuple, which raised on every frame.
+        confirmed = conf_t.update(survivors)
+        on = bool(confirmed)
         if on:
             alarms += 1
-        elif survivors:
-            for p in survivors:
+        held = {id(c) for c in confirmed}
+        for p in survivors:
+            if id(p) not in held:
                 verdicts.append((p, "temporal",
-                                 f"needs {T['confirm_frames']} of last "
+                                 f"seen {conf_t.hits(p.xyxy)}x, needs "
+                                 f"{T['confirm_frames']} of last "
                                  f"{T['window_frames']} frames"))
 
         for _, why, _ in verdicts:
@@ -163,7 +178,9 @@ def main():
                  "aspect": "dropped: box not wide enough (min_aspect_ratio)",
                  "edge": "dropped: box clipped by frame border",
                  "veto": "dropped: animal veto",
-                 "temporal": "held back: not enough consecutive frames",
+                 "temporal": "held back: not enough repeat sightings of that box",
+                 "duplicate_box": "merged: same object already had a box",
+                 "negative_override": "dropped: a distractor scored higher on the same box",
                  "ALARM": "ALARM RAISED"}.get(why, why)
         print(f"   {label:<48} {n}")
     if not reasons:

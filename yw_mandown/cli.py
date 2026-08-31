@@ -55,6 +55,10 @@ class LockedDetector:
         return self._detector.filter_by_geometry(
             positives, min_aspect_ratio, frame_shape, edge_mode, edge_margin)
 
+    def dedupe(self, positives, negatives):
+        # pure box arithmetic, no model call -- no lock needed
+        return self._detector.dedupe(positives, negatives)
+
     def apply_veto(self, frame, positives):
         with self._lock:
             return self._veto.apply(frame, positives)
@@ -69,6 +73,8 @@ def build_detector(cfg):
         image_size=cfg["model"]["image_size"],
         device=cfg["model"]["device"],
         conf_threshold=cfg["prompts"]["conf_threshold"],
+        duplicate_iou=cfg["prompts"]["duplicate_iou"],
+        negative_override_iou=cfg["prompts"]["negative_override_iou"],
     )
 
 

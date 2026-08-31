@@ -5,9 +5,10 @@
 /.venv
 
 *.pt
-
+*.ts
 # Live config carries RTSP credentials. Only the example, which uses ${VARS},
 # belongs in the repo.
 /config/config.yaml
 /config/*.bak
 /.env
+/mobileclip_blt.ts

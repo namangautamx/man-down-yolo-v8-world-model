@@ -24,6 +24,18 @@ prompt list would cost about 30% of detections; deleting the veto cost nothing.
 
 What separates a standing person from a fallen one is geometry, not class
 overlap -- see filter_by_geometry below.
+
+One narrow exception was added later, in _dedupe: a positive IS dropped when a
+distractor claims essentially the SAME box (IoU >= 0.75) AND outscores it. That
+is not the old veto -- it fired at IoU 0.30 on any overlap, which is what let a
+mattress under a fallen person delete the casualty. Read _dedupe for why the
+two thresholds make that failure impossible here.
+
+On duplicate boxes
+------------------
+ultralytics runs NMS per class, so classes never suppress each other and one
+person yields one box per prompt that fires on them -- measured at 2.85 boxes
+per person across logs/events.jsonl. _dedupe merges them.
 """
 
 
@@ -68,7 +80,8 @@ class Detection:
 
 class YoloWorldDetector:
     def __init__(self, model_name, positive_prompts, negative_prompts,
-                 image_size, device, conf_threshold):
+                 image_size, device, conf_threshold,
+                 duplicate_iou=0.60, negative_override_iou=0.75):
         self.positive_prompts = list(positive_prompts)
         # set as classes to absorb look-alike boxes; never reported as detections
         self.negative_prompts = list(negative_prompts or [])
@@ -76,6 +89,8 @@ class YoloWorldDetector:
         self.image_size = image_size
         self.device = device
         self.conf_threshold = conf_threshold
+        self.duplicate_iou = duplicate_iou
+        self.negative_override_iou = negative_override_iou
 
         from ultralytics import YOLOWorld  # imported here, not at module load,
                                             # so this module stays testable without torch
@@ -83,13 +98,56 @@ class YoloWorldDetector:
         print(f"Loading {model_name} ...")
         self.model = YOLOWorld(model_name)
         self.model.set_classes(self.all_prompts)
+        # Move the weights ONCE. ultralytics only honours `device` when it is
+        # passed to predict(), and the model otherwise sits in system RAM --
+        # measured 15.7ms/frame with `device: cuda` in the config and the
+        # weights still on the CPU. set_classes() must come first: it attaches
+        # the CLIP text encoder, and that has to move too.
+        self._pin(device)
         print(f"Loaded. {len(self.positive_prompts)} positive prompts, "
               f"{len(self.negative_prompts)} distractor classes.")
 
+    def _pin(self, device):
+        """Put the weights on the target device once, and free the text encoder.
+
+        The CLIP text encoder is only needed by set_classes(). Once the class
+        embeddings are computed it is dead weight -- measured 164M parameters
+        resident for a 13M detector, on every model instance including the veto
+        pass. Dropping it is what brings the process back under the parameter
+        budget.
+        """
+        import torch
+        dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            self.model.model.to(dev)
+            self.model.overrides["device"] = dev
+        except Exception as e:
+            print(f"  could not pin weights to {dev}: {e}")
+            return
+        # the text encoder has served its purpose; release it
+        freed = 0
+        for attr in ("clip_model", "text_model", "txt_model"):
+            m = getattr(self.model.model, attr, None)
+            if m is not None:
+                try:
+                    freed += sum(p.numel() for p in m.parameters())
+                except Exception:
+                    pass
+                setattr(self.model.model, attr, None)
+        n = sum(p.numel() for p in self.model.model.parameters()) / 1e6
+        print(f"  weights on {dev}, {n:.1f}M parameters"
+              + (f" (released {freed/1e6:.0f}M text encoder)" if freed else ""))
+
     def infer(self, frame):
-        """Returns the positive detections above conf_threshold, clamped to the
-        frame. Boxes that land on a negative class are dropped here -- that is
-        the whole point of listing them."""
+        """Returns (positives, negatives, shadows).
+
+        positives   detections above conf_threshold, clamped to the frame
+        negatives   distractor-class boxes; never reported, but needed by
+                    dedupe(), so they are handed back rather than dropped here
+        shadows     distractor boxes that claimed a region no positive is in
+
+        Deduplication is deliberately NOT done here -- see dedupe().
+        """
         h, w = frame.shape[:2]
         results = self.model.predict(
             frame,
@@ -102,7 +160,7 @@ class YoloWorldDetector:
 
         positives, negatives = [], []
         if result.boxes is None:
-            return positives, []
+            return positives, [], []
 
         for box in result.boxes:
             class_id = int(box.cls[0].cpu().numpy())
@@ -131,7 +189,97 @@ class YoloWorldDetector:
         # without). Making the failure visible is the fix; guessing is not.
         shadows = [n for n in negatives
                    if not any(iou(n.xyxy, p.xyxy) >= 0.30 for p in positives)]
-        return positives, shadows
+        return positives, negatives, shadows
+
+    def dedupe(self, positives, negatives):
+        """Merge boxes that describe the same object, and drop positives the
+        model itself scores better as a distractor.
+
+        MUST RUN AFTER THE GEOMETRY GATE, and the pipeline calls it there. Both
+        rules below keep the highest-CONFIDENCE box of a group, and confidence
+        says nothing about whether a box is shaped like a fallen person. Run
+        before geometry, a fallen person carrying a good box at w/h 1.5 conf
+        0.50 and a bad half-body box at w/h 0.6 conf 0.55 loses the good box to
+        the bad one, which geometry then rejects -- turning two boxes on a real
+        casualty into none. After geometry, only boxes that already passed the
+        shape test compete, and the merge cannot lose a detection.
+
+        Why this is needed at all: ultralytics runs NMS PER CLASS by default
+        (`agnostic=False` offsets each class into its own coordinate space --
+        ultralytics/utils/nms.py). Two classes therefore never suppress each
+        other, so one person produces one box per prompt that fires on them.
+        Measured on logs/events.jsonl: 112,876 alarm boxes over 39,539 distinct
+        objects -- 2.85 boxes per person, 65% of every box drawn a duplicate of
+        one already there.
+
+        Two separate rules, with deliberately different thresholds:
+
+        positive vs positive (duplicate_iou, default 0.60)
+            "a person fallen" and "a person lying on the ground" landing on one
+            body. Keep the highest-scoring box; the others say nothing new. This
+            cannot change WHETHER a person is detected, only how many times.
+
+        positive vs negative (negative_override_iou, default 0.75, and the
+        negative must also score HIGHER)
+            The model drew essentially the same box twice and preferred the
+            distractor: "a person standing" 0.80 against "a person fallen" 0.45
+            on one upright body. Currently the positive survives untouched,
+            which is why standing people alarm.
+
+            This is NOT the old negative veto, which was removed for good
+            reason: that one fired at IoU 0.30 on ANY overlap and deleted 39
+            genuine man-downs on crash-mat footage, because the model finds the
+            mattress UNDERNEATH a fallen person. The two differences that make
+            this safe are exactly the two that case failed:
+              * 0.75 needs near-identical boxes. A mat box wraps the person and
+                extends well past them, so it does not reach that overlap.
+              * the distractor must WIN on confidence. On the crash-mat footage
+                the mat scored 0.15-0.35 while the person scored higher, so it
+                could not have overridden anything even at matching IoU.
+            DEFAULT OFF (0.0), and the reason is a measurement, not caution.
+            On the 24:58 casualty in eqiom_video, while he was flat on the
+            ground, the model scored the SAME box:
+
+                t=1496   "a person fallen" 0.167   "a person standing" 0.250
+                t=1498   "a person fallen" 0.039   "a person standing" 0.355
+                t=1500   "a person fallen" 0.091   "a person standing" 0.342
+
+            The distractor won on every frame of a real man-down. Today the
+            positive is already below conf_threshold so this rule changes
+            nothing there -- but the obvious remedy for that miss is to lower
+            conf_threshold, and this rule would then delete the casualty
+            instead. That is the removed veto's failure with a new name.
+
+            Enable it only after checking logs/audit.jsonl for stage "dedupe",
+            reason "negative_override", against footage of real falls on YOUR
+            cameras. Every drop is logged with the box that beat it.
+        """
+        dropped = []
+
+        kept = []
+        for p in sorted(positives, key=lambda d: -d.conf):
+            dup = next((k for k in kept
+                        if iou(p.xyxy, k.xyxy) >= self.duplicate_iou), None)
+            if dup is None:
+                kept.append(p)
+            else:
+                dropped.append((p, "duplicate_box", iou(p.xyxy, dup.xyxy)))
+
+        if not self.negative_override_iou or not negatives:
+            return kept, dropped
+
+        survivors = []
+        for p in kept:
+            beat = next((n for n in negatives
+                         if n.conf > p.conf
+                         and iou(p.xyxy, n.xyxy) >= self.negative_override_iou),
+                        None)
+            if beat is None:
+                survivors.append(p)
+            else:
+                dropped.append((p, f"negative_override:{beat.class_name}",
+                                beat.conf))
+        return survivors, dropped
 
     @staticmethod
     def _clipped_by_edge(box, frame_shape, mode, margin):
@@ -231,6 +379,7 @@ class SecondPassVeto:
               f"{', '.join(self.prompts)}) ...")
         self.model = YOLOWorld(model_name)
         self.model.set_classes(self.prompts)
+        YoloWorldDetector._pin(self, device)
 
     @property
     def enabled(self):

@@ -28,8 +28,72 @@ prompts:
     - "a mattress"
     - "a pile of bags"
 
+  # Duplicate boxes. ultralytics runs NMS PER CLASS, so two prompts never
+  # suppress each other and one person gets one box per prompt that fires on
+  # them -- measured at 2.85 boxes per person. Merge boxes overlapping this
+  # much, keeping the highest-scoring one. Runs AFTER the geometry gate so a
+  # correctly-shaped box cannot be merged away by a higher-scoring badly-shaped
+  # one that geometry was about to reject.
+  duplicate_iou: 0.60
+
+  # Drop a positive when a distractor claims essentially the SAME box AND
+  # outscores it ("a person standing" 0.80 vs "a person fallen" 0.45 on one
+  # upright body). Without this the negative prompts reject nobody.
+  # NOT the removed negative veto: that matched any overlap at IoU 0.30 and
+  # deleted 39 real man-downs (mattress under the casualty). Here the boxes
+  # must be near-identical AND the distractor must win on confidence, which the
+  # mattress never did. Every drop is logged to audit.jsonl. 0 disables.
+  negative_override_iou: 0.0     # OFF by default -- see the note above
+
   conf_threshold: 0.25          # positive detections below this are discarded
 
+
+# ----------------------------------------------------------------------------
+# Geometry gate. A person on the floor projects a WIDE box, a standing person a
+# TALL one. This is the ONLY stage in the pipeline that looks at posture, so it
+# does most of the real filtering. Lowering it admits upright people.
+# ----------------------------------------------------------------------------
+geometry:
+  min_aspect_ratio: 0.7         # reject boxes with width/height below this.
+                                # 0 or null disables. Disabled automatically on
+                                # sources with mount: overhead, where an
+                                # axis-aligned test fires backwards.
+  reject_edge_touching: "bottom"  # "none" | "bottom" | "any" -- a box clipped by
+                                #  the frame has a meaningless aspect ratio
+  edge_margin_px: 3
+
+# ----------------------------------------------------------------------------
+# Flicker filter: confirm_frames sightings of THE SAME BOX within the last
+# window_frames inference frames. Counted in INFERENCE frames, so with
+# frame_skip 2 a window of 4 spans 8 video frames.
+# ----------------------------------------------------------------------------
+temporal:
+  enabled: true
+  confirm_frames: 2             # need this many sightings...
+  window_frames: 4              # ...within this many recent inference frames...
+  match_iou: 0.30               # ...OF THE SAME BOX, matched frame to frame.
+                                # Per box, not per frame: one global window let
+                                # any confirmed box open the gate for every
+                                # other box in the picture, including ones on
+                                # their first ever frame.
+
+# ----------------------------------------------------------------------------
+# Stillness gate. Holds a box back until it proves it is not moving, which is
+# what separates a fallen person from a crouching one. DELAYS EVERY ALARM by
+# still_seconds -- that is the mechanism, not a side effect.
+#
+# Note what it does NOT do: it measures movement, not posture. A person
+# standing still passes it perfectly. Posture is geometry.min_aspect_ratio's
+# job, and currently nothing else's.
+# ----------------------------------------------------------------------------
+stillness:
+  enabled: true
+  still_seconds: 2.0            # how long a box must hold position before alarming
+  max_drift: 2.0                # box-widths of centroid movement per SECOND
+  max_growth: 3.0               # box-area change per SECOND
+  match_iou: 0.30               # IoU needed to call it the same box next frame
+  track_timeout_seconds: 15.0   # forget a track unseen for this long
+  min_observations: 4           # never confirm on fewer sightings than this
 
 processing:
   frame_skip: 2                 # run inference on every Nth frame; display/clips still get every frame

@@ -31,6 +31,15 @@ DEFAULTS = {
         "veto_conf": 0.45,
         "veto_iou": 0.30,
         "veto_containment": 0.60,
+        # ultralytics runs NMS per class, so one person yields one box per
+        # prompt that fires on them. Merge boxes overlapping this much.
+        "duplicate_iou": 0.60,
+        # drop a positive when a distractor claims essentially the same box AND
+        # outscores it. DEFAULT OFF -- measured on the 24:58 casualty in
+        # eqiom_video, the model preferred "a person standing" over "a person
+        # fallen" on the same box every frame he was on the ground. See
+        # YoloWorldDetector._dedupe.
+        "negative_override_iou": 0.0,
     },
     "geometry": {
         "min_aspect_ratio": 1.0,        # 0 / null disables the check
@@ -41,6 +50,7 @@ DEFAULTS = {
         "enabled": True,
         "confirm_frames": 2,     # need this many detections...
         "window_frames": 4,      # ...within this many recent inference frames
+        "match_iou": 0.30,       # ...OF THE SAME BOX, matched frame to frame
     },
     "stillness": {
         "enabled": True,
@@ -262,6 +272,25 @@ def _validate(cfg, path):
     if not isinstance(vk, (int, float)) or not (0 < vk <= 1):
         errors.append(f"prompts.veto_containment must be in (0, 1], got {vk!r}")
 
+    di = cfg["prompts"]["duplicate_iou"]
+    if not isinstance(di, (int, float)) or not (0 < di <= 1):
+        errors.append(f"prompts.duplicate_iou must be in (0, 1], got {di!r}")
+    no = cfg["prompts"]["negative_override_iou"]
+    if not isinstance(no, (int, float)) or not (0 <= no <= 1):
+        errors.append(f"prompts.negative_override_iou must be in [0, 1] "
+                      f"(0 disables), got {no!r}")
+    elif 0 < no < 0.5:
+        # the removed negative veto matched at 0.30 and deleted 39 genuine
+        # man-downs, because a mattress under a fallen person overlaps them at
+        # exactly that sort of value. Loosening this reintroduces that failure.
+        warnings.append(
+            f"prompts.negative_override_iou is {no}, low enough that a "
+            f"distractor merely OVERLAPPING a person can delete them. The veto "
+            f"removed from this project matched at 0.30 and erased 39 real "
+            f"man-downs on crash-mat footage. Keep this at 0.75 or disable it "
+            f"with 0."
+        )
+
     T = cfg["temporal"]
     for key in ("confirm_frames", "window_frames"):
         if not isinstance(T[key], int) or T[key] < 1:
@@ -270,6 +299,8 @@ def _validate(cfg, path):
             and T["window_frames"] < T["confirm_frames"]):
         errors.append(f"temporal.window_frames ({T['window_frames']}) must be >= "
                       f"temporal.confirm_frames ({T['confirm_frames']})")
+    if not isinstance(T["match_iou"], (int, float)) or not (0 < T["match_iou"] <= 1):
+        errors.append(f"temporal.match_iou must be in (0, 1], got {T['match_iou']!r}")
 
     S = cfg["stillness"]
     if S["still_seconds"] < 0:

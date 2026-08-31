@@ -18,47 +18,100 @@ from .detector import iou
 
 
 class TemporalConfirmer:
-    """Require N detections within the last M inference frames before alarming.
+    """Require N sightings of THE SAME BOX within the last M inference frames.
 
     Purpose is narrow: stop a single-frame flicker from raising an alarm. On the
     cam1 live run, 158 detected frames were spread over 29 separate runs, 13 of
     them one frame long -- those are what this removes.
 
-    STRICTLY SUBTRACTIVE. update() returns either this frame's live detections or
-    an empty list. It never returns a stored box, never extends an alarm across a
-    frame the model was silent on, and never invents anything. The previous
-    version had a "hold" that did exactly that; it is gone. Keep it gone.
+    PER BOX, not per frame
+    ----------------------
+    This gate used to hold one boolean window for the whole camera: "did ANY
+    detection appear in this frame". Once any box satisfied N-of-M the gate
+    opened, and it then passed every OTHER box in the frame straight through --
+    including one appearing for the very first time. Demonstrated:
+
+        frame 1  [A]      A is a genuine fall
+        frame 2  [A]      2-of-4 satisfied, gate opens
+        frame 3  [A, B]   B has never been seen before
+                 -> both released; B was never filtered at all
+
+    On a busy camera one real fall therefore disabled the flicker filter for
+    everything else in view, permanently. The audit log shows what that cost:
+    152 flicker rejections against 729 alarms, so it was barely filtering.
+
+    Each box now carries its own N-of-M window, matched frame to frame by IoU,
+    exactly like StillnessGate. A box must earn its own repeat evidence and can
+    inherit nothing from another.
+
+    STRICTLY SUBTRACTIVE. update() returns a subset of the detections passed in.
+    It never returns a stored box, never extends an alarm across a frame the
+    model was silent on, and never invents anything. An older version had a
+    "hold" that did exactly that; it is gone. Keep it gone.
 
     Deliberately short: the stillness gate already imposes the long wait, so a
     second long confirmation on top would only delay a real alarm. This is a
     flicker filter, not a second opinion.
     """
 
-    def __init__(self, confirm_frames, window_frames):
+    def __init__(self, confirm_frames, window_frames, match_iou=0.30):
         if window_frames < confirm_frames:
             raise ValueError("window_frames must be >= confirm_frames")
         self.confirm_frames = confirm_frames
-        self._window = deque(maxlen=window_frames)
-        self._active = False
+        self.window_frames = window_frames
+        self.match_iou = match_iou
+        self._tracks = []
 
-    @property
-    def active(self):
-        return self._active
+    def reset(self):
+        """Forget everything. Called at a video-folder cut, where the next frame
+        is an unrelated scene and no track may survive."""
+        self._tracks = []
+
+    def hits(self, box):
+        """How many of the last window_frames this box was seen in, for the
+        audit log -- so a rejection records the number responsible."""
+        i = self._match(box, used=())
+        return sum(self._tracks[i]["window"]) if i is not None else 0
+
+    def _match(self, box, used):
+        """Index of the best-overlapping unused track, or None. Does not claim
+        it -- the caller decides whether to."""
+        best, best_iou = None, 0.0
+        for i, t in enumerate(self._tracks):
+            if i in used:
+                continue
+            v = iou(box, t["box"])
+            if v > best_iou:
+                best, best_iou = i, v
+        return best if best_iou >= self.match_iou else None
 
     def update(self, detections):
         """Feed one inference frame's surviving detections. Returns the ones
-        allowed through -- always a subset of what was passed in."""
-        had = len(detections) > 0
-        self._window.append(had)
+        whose OWN window now holds enough sightings."""
+        # every existing track is assumed unseen until a detection claims it,
+        # so a box that stops appearing ages out of its own window
+        for t in self._tracks:
+            t["window"].append(False)
 
-        if sum(self._window) >= self.confirm_frames:
-            self._active = True
-        elif not had:
-            # nothing now, and not enough recent evidence: stand down
-            self._active = False
+        used = set()
+        released = []
+        for det in detections:
+            i = self._match(det.xyxy, used)
+            if i is None:
+                t = {"box": det.xyxy,
+                     "window": deque([True], maxlen=self.window_frames)}
+                self._tracks.append(t)
+            else:
+                used.add(i)
+                t = self._tracks[i]
+                t["window"][-1] = True
+                t["box"] = det.xyxy
+            if sum(t["window"]) >= self.confirm_frames:
+                released.append(det)
 
-        # a frame with no live detection yields nothing, whatever the state
-        return list(detections) if (self._active and had) else []
+        # a track with no sighting anywhere in its window is dead
+        self._tracks = [t for t in self._tracks if any(t["window"])]
+        return released
 
 
 def _median(xs):
@@ -85,6 +138,10 @@ class StillnessGate:
 
         genuinely fallen   0.0009  0.0012  0.0013  0.0015  0.0046
         walking / active   0.0276  0.0320  0.0373
+
+    Those were per INFERENCE FRAME. Drift is now measured per SECOND of
+    video, so the limit means the same thing on a 15fps camera and a 120fps
+    one. The configured value is scaled accordingly.
 
     Thirty times apart, normalised by box size so it is independent of
     resolution and distance. Growth is checked too: a person walking INTO the
@@ -116,16 +173,22 @@ class StillnessGate:
     read as a jump.
     """
 
-    def __init__(self, min_frames, max_drift, match_iou, max_growth,
-                 track_timeout, min_observations=4):
-        self.min_frames = max(1, int(min_frames))
+    def __init__(self, still_seconds, max_drift, match_iou, max_growth,
+                 track_timeout_seconds, min_observations=4, window_cap=240):
+        self.still_seconds = max(0.0, float(still_seconds))
         self.max_drift = max_drift
         self.match_iou = match_iou
         self.max_growth = max_growth
-        self.track_timeout = track_timeout
+        self.track_timeout_seconds = max(0.0, float(track_timeout_seconds))
         self.min_observations = max(2, int(min_observations))
+        self.window_cap = max(4, int(window_cap))
         self._tracks = []
-        self._frame = 0
+        self._now = 0.0
+
+    def reset(self):
+        """Forget every track. Called at a video-folder cut, where the next
+        frame is an unrelated scene and no track may survive."""
+        self._tracks = []
 
     @staticmethod
     def _centre_size_area(box):
@@ -149,8 +212,8 @@ class StillnessGate:
             return None
         w = best["window"]
         return {
-            "elapsed": self._frame - best["first"],
-            "need": self.min_frames,
+            "elapsed": round(self._now - best["first"], 2),
+            "need": self.still_seconds,
             "observations": len(w),
             "min_observations": self.min_observations,
             "median_drift": _median([x[0] for x in w]) if w else None,
@@ -158,10 +221,17 @@ class StillnessGate:
             "confirmed": best["confirmed"],
         }
 
-    def update(self, detections):
-        """Feed this frame's surviving detections. Returns only those whose
-        track has held position long enough."""
-        self._frame += 1
+    def update(self, detections, now_sec=None):
+        """Feed this frame's surviving detections and the video timestamp.
+
+        Time comes from the VIDEO, not from a frame count. Counting frames made
+        every threshold depend on the source frame rate and on how fast the GPU
+        happened to be running: still_seconds 6.0 meant 360 inference frames on
+        120fps footage (impossible in an 781-frame clip) and 45 on a 15fps
+        camera. Same setting, two completely different gates. Timestamps make
+        the setting mean one thing everywhere.
+        """
+        self._now = float(now_sec) if now_sec is not None else self._now + 1.0
         for t in self._tracks:
             t["matched"] = False
 
@@ -180,15 +250,15 @@ class StillnessGate:
             if best is None or best_iou < self.match_iou:
                 self._tracks.append({
                     "box": det.xyxy, "centre": centre, "size": size,
-                    "area": area, "window": deque(maxlen=self.min_frames),
-                    "confirmed": False, "first": self._frame,
-                    "last": self._frame, "matched": True,
+                    "area": area, "window": deque(maxlen=self.window_cap),
+                    "confirmed": False, "first": self._now,
+                    "last": self._now, "matched": True, "anchor": None,
                 })
                 continue
 
             # per-frame drift: divide by the gap since we last saw it, otherwise
             # a blink in the detector reads as the person jumping
-            gap = max(1, self._frame - best["last"])
+            gap = max(1e-3, self._now - best["last"])   # seconds since last seen
             drift = math.hypot(centre[0] - best["centre"][0],
                                centre[1] - best["centre"][1]) / \
                 max(1.0, (size + best["size"]) / 2.0) / gap
@@ -196,11 +266,11 @@ class StillnessGate:
 
             best["window"].append((drift, growth))
             best.update(box=det.xyxy, centre=centre, size=size, area=area,
-                        last=self._frame, matched=True)
+                        last=self._now, matched=True)
 
-            elapsed = self._frame - best["first"]
+            elapsed = self._now - best["first"]
             w = best["window"]
-            if elapsed >= self.min_frames and len(w) >= self.min_observations:
+            if elapsed >= self.still_seconds and len(w) >= self.min_observations:
                 # MEDIAN drift, not a count of "still" frames. A fallen person's
                 # box wobbles hard on a minority of frames (p50 0.002-0.007 but
                 # p90 up to 0.14); counting flags gave a still-ratio of 0.58 and
@@ -209,14 +279,42 @@ class StillnessGate:
                 md = _median([x[0] for x in w])
                 mg = _median([x[1] for x in w])
                 if md <= self.max_drift and mg <= self.max_growth:
+                    if not best["confirmed"]:
+                        # remember WHERE it earned this. See the anchor check.
+                        best["anchor"] = det.xyxy
                     best["confirmed"] = True
                 elif md > self.max_drift * 2 or mg > self.max_growth * 2:
                     best["confirmed"] = False
+                    best["anchor"] = None
+
+            # A confirmed track may only keep its status while it is still the
+            # thing that earned it. `confirmed` is otherwise permanent: the only
+            # release path above needs median drift over 2x max_drift, and the
+            # median is taken over up to window_cap sightings, so it moves far
+            # too slowly to ever fire. Two real consequences:
+            #
+            #   * the fallen person gets up and walks off, but the track keeps
+            #     matching them (IoU only has to reach match_iou) and keeps
+            #     alarming while they walk
+            #   * someone else steps into that spot and is released INSTANTLY,
+            #     never having waited still_seconds themselves
+            #
+            # Anchoring to the box at confirmation time closes both. A genuinely
+            # stationary casualty keeps near-perfect overlap with where it was
+            # confirmed, so this cannot cost a real detection; anything that has
+            # moved off that spot must earn confirmation again from scratch.
+            if best["confirmed"] and best["anchor"] is not None:
+                if iou(det.xyxy, best["anchor"]) < self.match_iou:
+                    best["confirmed"] = False
+                    best["anchor"] = None
+                    best["first"] = self._now      # re-earn the wait in the new
+                    best["window"].clear()         # position, from zero
+
             if best["confirmed"]:
                 released.append(det)
 
         self._tracks = [t for t in self._tracks
-                        if self._frame - t["last"] <= self.track_timeout]
+                        if self._now - t["last"] <= self.track_timeout_seconds]
         return released
 
 

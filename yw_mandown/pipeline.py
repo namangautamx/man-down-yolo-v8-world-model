@@ -11,6 +11,7 @@ project this is a sibling of).
 """
 
 import os
+import threading
 import time
 
 import cv2
@@ -61,23 +62,19 @@ class SourcePipeline:
 
         t_cfg = cfg["temporal"]
         self._confirmer = TemporalConfirmer(
-            t_cfg["confirm_frames"], t_cfg["window_frames"],
+            t_cfg["confirm_frames"], t_cfg["window_frames"], t_cfg["match_iou"],
         ) if t_cfg["enabled"] else None
 
         s_cfg = cfg["stillness"]
-        # seconds -> INFERENCE frames: the gate only sees frames we ran inference on
-        fps = getattr(source, "fps_hint", lambda: 25.0)()
-        still_frames = max(1, round(s_cfg["still_seconds"] * fps / self.frame_skip))
+        # seconds in, seconds used -- no frame-rate conversion anywhere
         self.stillness = StillnessGate(
-            still_frames, s_cfg["max_drift"], s_cfg["match_iou"],
-            s_cfg["max_growth"],
-            max(1, round(s_cfg["track_timeout_seconds"] * fps / self.frame_skip)),
+            s_cfg["still_seconds"], s_cfg["max_drift"], s_cfg["match_iou"],
+            s_cfg["max_growth"], s_cfg["track_timeout_seconds"],
             s_cfg["min_observations"],
         ) if s_cfg["enabled"] else None
         if self.stillness is not None:
             print(f"[{self.source_id}] stillness: a box must hold position for "
-                  f"{still_frames} inference frames (~{s_cfg['still_seconds']:.1f}s "
-                  f"at {fps:.0f}fps / skip {self.frame_skip}) before it alarms")
+                  f"{s_cfg['still_seconds']:.1f}s of video before it alarms")
 
 
         out_cfg = cfg["output"]
@@ -111,6 +108,7 @@ class SourcePipeline:
         self.stale_after = cfg["logging"].get("stale_after_seconds", 30.0)
         self._last_frame_wall = time.time()
         self._stale_warned = False
+        self._watchdog = None
 
         self._alarm = False
         self._draw_positives = []
@@ -128,17 +126,19 @@ class SourcePipeline:
         detection_count = 0
         frame_count = 0
 
+        self._start_watchdog()
+
         for frame_number, video_time_sec, frame in self.source:
-            now = time.time()
-            if now - self._last_frame_wall > self.stale_after:
-                gap = now - self._last_frame_wall
-                print(f"[{self.source_id}] WATCHDOG: no frame for {gap:.0f}s "
-                      f"(limit {self.stale_after:.0f}s) -- this source was not "
-                      f"watching anything for that period")
-                self.audit.log(self.source_id, frame_number, video_time_sec, None,
-                               "watchdog", "stalled", reason="frame_gap",
-                               measured=gap, limit=self.stale_after)
-            self._last_frame_wall = now
+            self._last_frame_wall = time.time()
+
+            # a folder source concatenates unrelated clips; a track must not
+            # survive the cut from one scene into the next
+            if getattr(self.source, "boundary", False):
+                self.source.boundary = False
+                if self.stillness is not None:
+                    self.stillness.reset()
+                if self._confirmer is not None:
+                    self._confirmer.reset()
 
             if self._stop:
                 break
@@ -158,7 +158,7 @@ class SourcePipeline:
                 A = self.audit
                 fn, vt = frame_number, video_time_sec
 
-                positives, shadows = self.detector.infer(frame)
+                positives, negatives, shadows = self.detector.infer(frame)
                 # a distractor class swallowed a region with no positive box
                 # near it -- possible silent loss of a real casualty
                 for sh in shadows:
@@ -185,6 +185,14 @@ class SourcePipeline:
                     A.log(self.source_id, fn, vt, p, "geometry", "rejected",
                           reason=reason, measured=measured, limit=limit)
 
+                # dedupe AFTER geometry, so only correctly-shaped boxes compete
+                # and the highest-confidence survivor cannot be a box geometry
+                # was about to reject. See YoloWorldDetector.dedupe.
+                positives, suppressed = self.detector.dedupe(positives, negatives)
+                for det, reason, measured in suppressed:
+                    A.log(self.source_id, fn, vt, det, "dedupe", "rejected",
+                          reason=reason, measured=measured)
+
                 # veto pass runs only when something already fired, and before
                 # stillness, so an animal never reaches the gate
                 if self.veto is not None and positives:
@@ -208,18 +216,22 @@ class SourcePipeline:
                 if self._confirmer is not None:
                     pre = positives
                     positives = self._confirmer.update(positives)
-                    if pre and not positives:
-                        for p in pre:
+                    # per box now, not per frame: some boxes in this frame can
+                    # pass while others are still short of their own evidence,
+                    # so each held box is logged with ITS OWN hit count
+                    passed = {id(p) for p in positives}
+                    for p in pre:
+                        if id(p) not in passed:
                             A.log(self.source_id, fn, vt, p, "flicker", "rejected",
                                   reason="awaiting_repeat_evidence",
-                                  measured=sum(self._confirmer._window),
+                                  measured=self._confirmer.hits(p.xyxy),
                                   limit=self._confirmer.confirm_frames)
 
                 # stillness last: a crouching person scores as high as a fallen
                 # one, so only time separates them
                 if self.stillness is not None:
                     pre = positives
-                    positives = self.stillness.update(positives)
+                    positives = self.stillness.update(positives, video_time_sec)
                     held = [p for p in pre if p not in positives]
                     for p in held:
                         info = self.stillness.track_info(p.xyxy)
@@ -300,6 +312,7 @@ class SourcePipeline:
                             self._stop = True
                             break
 
+        self._stop_watchdog()
         if self._recorder is not None:
             self._recorder.close()
         if self.show_window:
@@ -316,6 +329,47 @@ class SourcePipeline:
         cv2.rectangle(frame, (x1, max(0, y1 - 35)), (x1 + 300, y1), colour, -1)
         cv2.putText(frame, label, (x1 + 5, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+    def _start_watchdog(self):
+        """Alarm on silence, from a thread of its own.
+
+        This used to live inside the frame loop, which meant it could only fire
+        when a frame ARRIVED -- so a camera that died completely never triggered
+        it, because the loop body never ran again. That is precisely the state a
+        liveness watchdog exists to catch: a safety system that has silently
+        stopped watching is more dangerous than one with known misses.
+        """
+        if self.stale_after <= 0:
+            return
+
+        def watch():
+            warned = False
+            while not self._stop:
+                time.sleep(min(2.0, self.stale_after / 4.0))
+                gap = time.time() - self._last_frame_wall
+                if gap > self.stale_after and not warned:
+                    print(f"[{self.source_id}] WATCHDOG: no frame for {gap:.0f}s "
+                          f"(limit {self.stale_after:.0f}s) -- this source is "
+                          f"NOT watching anything")
+                    self.audit.log(self.source_id, -1, gap, None, "watchdog",
+                                   "stalled", reason="no_frames",
+                                   measured=gap, limit=self.stale_after)
+                    warned = True
+                elif gap <= self.stale_after and warned:
+                    print(f"[{self.source_id}] WATCHDOG: frames resumed")
+                    self.audit.log(self.source_id, -1, gap, None, "watchdog",
+                                   "recovered", reason="frames_resumed",
+                                   measured=gap, limit=self.stale_after)
+                    warned = False
+
+        self._watchdog = threading.Thread(target=watch, daemon=True,
+                                          name=f"watchdog-{self.source_id}")
+        self._watchdog.start()
+
+    def _stop_watchdog(self):
+        self._stop = True
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=3.0)
 
     def _draw_candidate(self, frame, det):
         """A box that passed the filters but has not been confirmed. Yellow, with

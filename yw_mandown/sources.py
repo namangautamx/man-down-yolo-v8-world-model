@@ -57,18 +57,36 @@ class VideoFolderSource:
             if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
         )
         self._fps = None
+        self.boundary = False
         if not self.files:
             print(f"[{source_id}] no video files found in {folder}")
 
     def __iter__(self):
+        """Timestamps are per-file and cumulative.
+
+        This used to divide a running frame count by the FIRST file's frame
+        rate, so every clip with a different rate got a wrong timestamp -- and
+        the temporal gates read timestamps, so a wrong one silently changes how
+        long "2 seconds of stillness" is. Each file now contributes its own real
+        duration to a monotonically increasing clock.
+
+        `boundary` flips at each new file so the pipeline can reset its temporal
+        state: two clips joined end to end are two different scenes, and a track
+        must not survive the cut.
+        """
         global_frame = 0
-        fps = self.fps_hint()  # hoisted: this opens a VideoCapture, so calling it
-                               # per frame cost ~0.9ms x every frame in the folder
+        t_offset = 0.0
         for path in self.files:
             print(f"[{self.source_id}] -> {path.name}")
-            for _, _, frame in VideoFileSource(path, self.source_id):
-                yield global_frame, global_frame / fps, frame
+            src = VideoFileSource(path, self.source_id)
+            fps = src.fps_hint()
+            self.boundary = True          # read and cleared by the pipeline
+            last_t = 0.0
+            for local_frame, _, frame in src:
+                last_t = local_frame / fps
+                yield global_frame, t_offset + last_t, frame
                 global_frame += 1
+            t_offset += last_t + (1.0 / fps if fps else 0.0)
 
     def fps_hint(self):
         if not self.files:
